@@ -12,7 +12,7 @@ set -u # Exit on undefined vars
 # --- Configuration ---
 VERSION="2.2.0"
 # [IMPORTANT] REPLACE THIS URL AFTER UPLOADING TO GITHUB
-UPDATE_URL="https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/tunnel.sh" 
+UPDATE_URL="https://raw.githubusercontent.com/dazaiop853-afk/tunnel-tool/main/tunnel.sh"
 
 KEY_NAME="conn_finder"
 KEY_DIR="$HOME/.ssh"
