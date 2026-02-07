@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Persistent SSH Reverse Tunnel Manager v3.0.0 (The Nuclear Option)
+# Persistent SSH Reverse Tunnel Manager v3.1.0 (Smart Re-Auth)
 # ==============================================================================
 set -u
 
-VERSION="3.0.0"
+VERSION="3.1.0"
 # [IMPORTANT] REPLACE WITH YOUR RAW GITHUB URL
 UPDATE_URL="https://raw.githubusercontent.com/dazaiop853-afk/tunnel-tool/main/tunnel.sh"
 
@@ -52,7 +52,6 @@ trap cleanup_on_exit INT TERM
 if [ "${1:-}" = "--update" ]; then
     log_info "Updating..."
     TMP=$(mktemp)
-    # Add random query param to bypass GitHub caching
     curl -sL "$UPDATE_URL?t=$(date +%s)" -o "$TMP"
     if bash -n "$TMP"; then
         mv "$TMP" "${BASH_SOURCE[0]}"
@@ -86,51 +85,93 @@ if [ ! -f "$KEY_PATH" ]; then
     ssh-keygen -t ed25519 -f "$KEY_PATH" -N "" -C "tunnel-$(date +%Y%m%d)" -q
 fi
 
-# --- Reachability ---
-check_reachability() {
+# --- Smart Reachability Check ---
+# Returns:
+# 0 = Fully Authorized (Ready to tunnel)
+# 2 = Reachable but Unauthorized (Needs Key Copy)
+# 1 = Unreachable (Network/Firewall issue)
+check_status() {
     local ip=$1; local port=$2; local user=$3
     printf "Testing %s@%s:%s ... " "$user" "$ip" "$port"
     
-    # 1. Check with our key (ignoring config)
+    # 1. Try with Key (Success case)
     if ssh $SSH_OPTS -o BatchMode=yes -p "$port" -i "$KEY_PATH" "$user@$ip" exit 2>/dev/null; then
         echo -e "${GREEN}Authorized${NC}"; return 0
     fi
     
-    # 2. Check if reachable but needs password
-    # We must allow password auth here, so we override IdentitiesOnly
+    # 2. Try Password Auth (Repair case)
+    # We override IdentitiesOnly to allow password fallback check
     local output
     output=$(ssh -F /dev/null -o UserKnownHostsFile=$KNOWN_HOSTS_FILE -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=5 -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive -p "$port" "$user@$ip" exit 2>&1) || true
     
+    # If we get "Permission denied", the server IS reachable, just needs keys.
     if echo "$output" | grep -qE "Permission denied|publickey|password"; then
-        echo -e "${GREEN}Reachable${NC}"; return 0
+        echo -e "${YELLOW}Needs Auth${NC}"; return 2
     fi
+    
     echo -e "${RED}Unreachable${NC}"; return 1
 }
 
 copy_ssh_id() {
     local user=$1; local ip=$2; local port=$3
-    log_info "Transferring key..."
-    # ssh-copy-id doesn't support -F /dev/null easily, so we fallback to manual pipe
+    log_warn "Access denied. Attempting to repair keys..."
+    log_info "Please enter the server password:"
+    
+    # Fallback pipe method for cross-platform compatibility
     cat "${KEY_PATH}.pub" | ssh -F /dev/null -o UserKnownHostsFile=$KNOWN_HOSTS_FILE -o StrictHostKeyChecking=accept-new -p "$port" "$user@$ip" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+    
+    return $?
 }
 
-# --- Config & Setup ---
+# --- 1. Load Config & Auto-Repair ---
+TARGET_IP=""
 if [ -f "$CONFIG_FILE" ]; then
     IFS=':' read -r SIP SPORT SUSER < "$CONFIG_FILE"
-    if check_reachability "$SIP" "$SPORT" "$SUSER"; then
+    
+    # Check the saved IP
+    check_status "$SIP" "$SPORT" "$SUSER"
+    STATUS=$?
+    
+    if [ $STATUS -eq 0 ]; then
+        # All good
         TARGET_IP="$SIP"; TARGET_PORT="$SPORT"; TARGET_USER="$SUSER"
+        log_success "Loaded from config: $TARGET_IP"
+    elif [ $STATUS -eq 2 ]; then
+        # Reachable, but keys missing (Server wiped?) -> REPAIR IT
+        if copy_ssh_id "$SUSER" "$SIP" "$SPORT"; then
+            TARGET_IP="$SIP"; TARGET_PORT="$SPORT"; TARGET_USER="$SUSER"
+            log_success "Access repaired."
+        else
+            log_error "Failed to repair access."
+            TARGET_IP=""
+        fi
     else
+        # Unreachable
+        log_warn "Saved IP unreachable. Switch to manual."
         TARGET_IP=""
     fi
-else
-    TARGET_IP=""
 fi
 
+# --- 2. Manual Entry Loop ---
 while [ -z "${TARGET_IP:-}" ]; do
     read -p "Enter server IP: " INPUT_IP
-    if check_reachability "$INPUT_IP" "$TARGET_PORT" "$TARGET_USER"; then
-        copy_ssh_id "$TARGET_USER" "$INPUT_IP" "$TARGET_PORT" && TARGET_IP="$INPUT_IP"
+    
+    check_status "$INPUT_IP" "$TARGET_PORT" "$TARGET_USER"
+    STATUS=$?
+    
+    if [ $STATUS -eq 0 ]; then
+        # Already good (rare for new IP, but possible)
+        TARGET_IP="$INPUT_IP"
+    elif [ $STATUS -eq 2 ]; then
+        # Reachable, needs keys -> Install them
+        if copy_ssh_id "$TARGET_USER" "$INPUT_IP" "$TARGET_PORT"; then
+            TARGET_IP="$INPUT_IP"
+        fi
+    fi
+    
+    if [ -n "$TARGET_IP" ]; then
         echo "${TARGET_IP}:${TARGET_PORT}:${TARGET_USER}" > "$CONFIG_FILE"
+        log_success "Configuration saved to $CONFIG_FILE"
     fi
 done
 
@@ -156,7 +197,7 @@ read -p "Continue? (yes/no): " C; [ "$C" != "yes" ] && exit 1
 # --- Tunnel Loop ---
 echo "=============================================="
 echo "  Remote: $TARGET_USER@$TARGET_IP:$TARGET_PORT"
-echo "  Version: $VERSION (Nuclear Option)"
+echo "  Version: $VERSION (Smart Re-Auth)"
 echo "=============================================="
 
 while true; do
