@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Persistent SSH Reverse Tunnel Manager v2.4.0
+# Persistent SSH Reverse Tunnel Manager v2.5.0
 # ==============================================================================
 set -u
 
-VERSION="2.4.0"
+VERSION="2.5.0"
 UPDATE_URL="https://raw.githubusercontent.com/dazaiop853-afk/tunnel-tool/main/tunnel.sh"
 
 KEY_NAME="conn_finder"
@@ -88,9 +88,6 @@ self_update() {
         exit 1
     fi
     
-    REMOTE_VERSION=$(grep '^VERSION=' "$TMP_FILE" | head -n1 | cut -d'"' -f2)
-    log_info "Remote version: $REMOTE_VERSION | Current: $VERSION"
-    
     mv "$TMP_FILE" "${BASH_SOURCE[0]}"
     chmod +x "${BASH_SOURCE[0]}"
     log_success "Updated. Restarting..."
@@ -124,7 +121,7 @@ if [ ! -f "$KEY_PATH" ]; then
     log_info "Generating SSH keys..."
     mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"
     ssh-keygen -t ed25519 -f "$KEY_PATH" -N "" -C "tunnel-$(date +%Y%m%d)" -q
-    log_success "Keys created at $KEY_PATH"
+    log_success "Keys created"
 fi
 
 check_reachability() {
@@ -132,7 +129,7 @@ check_reachability() {
     local port=$2
     local user=$3
     
-    log_debug "Checking reachability: $user@$ip:$port"
+    printf "Testing %s@%s:%s ... " "$user" "$ip" "$port"
     
     if ssh -o BatchMode=yes \
            -o ConnectTimeout=5 \
@@ -141,7 +138,7 @@ check_reachability() {
            -p "$port" \
            -i "$KEY_PATH" \
            "$user@$ip" exit 2>/dev/null; then
-        log_debug "Server authorized (key already installed)"
+        echo -e "${GREEN}Authorized${NC}"
         return 0
     fi
     
@@ -156,14 +153,12 @@ check_reachability() {
                  -p "$port" \
                  "$user@$ip" exit 2>&1) || true
     
-    log_debug "SSH probe output: $output"
-    
     if echo "$output" | grep -qE "Permission denied|publickey|password|keyboard-interactive"; then
-        log_debug "Server reachable but needs authentication"
+        echo -e "${GREEN}Reachable${NC}"
         return 0
     fi
     
-    log_debug "Server unreachable or connection failed"
+    echo -e "${RED}Unreachable${NC}"
     return 1
 }
 
@@ -172,8 +167,7 @@ copy_ssh_id() {
     local ip=$2
     local port=$3
     
-    log_info "Transferring public key to $user@$ip:$port"
-    log_warn "You will be prompted for password"
+    log_info "Transferring key to $user@$ip:$port"
     
     if command -v ssh-copy-id >/dev/null 2>&1; then
         ssh-copy-id -i "${KEY_PATH}.pub" \
@@ -188,26 +182,20 @@ copy_ssh_id() {
                                     "$user@$ip" \
                                     "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
     fi
-    
-    return $?
 }
 
 if [ -f "$CONFIG_FILE" ]; then
-    log_debug "Loading saved configuration from $CONFIG_FILE"
     IFS=':' read -r SAVED_IP SAVED_PORT SAVED_USER < "$CONFIG_FILE"
-    log_debug "Saved: $SAVED_USER@$SAVED_IP:$SAVED_PORT"
     
     if check_reachability "$SAVED_IP" "$SAVED_PORT" "$SAVED_USER"; then
         TARGET_IP="$SAVED_IP"
         TARGET_PORT="$SAVED_PORT"
         TARGET_USER="$SAVED_USER"
-        log_success "Using saved server: $TARGET_USER@$TARGET_IP:$TARGET_PORT"
+        log_success "Using saved: $TARGET_USER@$TARGET_IP:$TARGET_PORT"
     else
-        log_warn "Saved server unreachable"
         TARGET_IP=""
     fi
 else
-    log_debug "No saved configuration found"
     TARGET_IP=""
 fi
 
@@ -215,125 +203,144 @@ while [ -z "${TARGET_IP:-}" ]; do
     printf "Enter server IP: "
     read -r INPUT_IP
     
-    log_debug "User entered IP: $INPUT_IP"
-    
-    if ! echo "$INPUT_IP" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$|^[a-zA-Z0-9.-]+$'; then
-        log_error "Invalid IP/hostname format"
-        continue
-    fi
-    
     if check_reachability "$INPUT_IP" "$TARGET_PORT" "$TARGET_USER"; then
-        log_info "Server is reachable"
-        
         if copy_ssh_id "$TARGET_USER" "$INPUT_IP" "$TARGET_PORT"; then
             TARGET_IP="$INPUT_IP"
             echo "${TARGET_IP}:${TARGET_PORT}:${TARGET_USER}" > "$CONFIG_FILE"
             chmod 600 "$CONFIG_FILE"
             log_success "Configuration saved"
-        else
-            log_error "Key transfer failed"
         fi
-    else
-        log_error "Server unreachable. Try again."
     fi
 done
 
 log_info "Verifying host key fingerprint..."
-ssh-keygen -l -f "$KNOWN_HOSTS_FILE" 2>/dev/null | grep "$TARGET_IP" || log_warn "No fingerprint found"
+ssh-keygen -l -f "$KNOWN_HOSTS_FILE" 2>/dev/null | grep "$TARGET_IP" || true
 
-printf "Continue with this host key? (yes/no): "
+printf "Continue? (yes/no): "
 read -r CONFIRM
 
 if [ "$CONFIRM" != "yes" ]; then
-    log_error "Host key verification rejected"
     exit 1
 fi
 
-log_success "Starting persistent reverse tunnel"
 echo ""
 echo "=============================================="
 echo "  Remote:        $TARGET_USER@$TARGET_IP:$TARGET_PORT"
-echo "  Reverse Port:  127.0.0.1:$REVERSE_PORT (on remote)"
-echo "  SOCKS5 Port:   127.0.0.1:$SOCKS_PORT (local)"
-echo "  Ctrl+C to stop"
+echo "  Reverse Port:  127.0.0.1:$REVERSE_PORT"
+echo "  SOCKS5:        127.0.0.1:$SOCKS_PORT"
 echo "=============================================="
 echo ""
 
-RETRY_COUNT=0
-MAX_RETRIES=10
+# PRE-FLIGHT CHECKS
+log_info "Running pre-flight diagnostics..."
 
-while true; do
-    log_debug "Cleaning remote port $REVERSE_PORT..."
-    
-    CLEANUP_SCRIPT='
-PORT=$1
-log() { echo "[CLEANUP] $*"; }
-
-log "Attempting to free port $PORT"
-
-if command -v fuser >/dev/null 2>&1; then
-    log "Using fuser..."
-    fuser -k -n tcp "$PORT" 2>/dev/null
-    log "fuser completed"
-    exit 0
+log_info "1. Testing basic SSH connection..."
+if ssh -o BatchMode=yes \
+       -o ConnectTimeout=10 \
+       -o StrictHostKeyChecking=yes \
+       -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" \
+       -p "$TARGET_PORT" \
+       -i "$KEY_PATH" \
+       "$TARGET_USER@$TARGET_IP" "echo 'SSH OK'" 2>/dev/null; then
+    log_success "SSH connection works"
+else
+    log_error "Basic SSH connection failed"
+    exit 1
 fi
 
-if command -v lsof >/dev/null 2>&1; then
-    log "Using lsof..."
-    PIDS=$(lsof -t -i:"$PORT" 2>/dev/null)
-    if [ -n "$PIDS" ]; then
-        echo "$PIDS" | while read -r pid; do
-            log "Killing PID: $pid"
-            kill "$pid" 2>/dev/null
-        done
-    fi
-    log "lsof completed"
-    exit 0
-fi
+log_info "2. Checking if port $REVERSE_PORT is available on remote..."
+PORT_CHECK=$(ssh -o BatchMode=yes \
+                 -o StrictHostKeyChecking=yes \
+                 -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" \
+                 -p "$TARGET_PORT" \
+                 -i "$KEY_PATH" \
+                 "$TARGET_USER@$TARGET_IP" \
+                 "netstat -ln 2>/dev/null | grep ':$REVERSE_PORT ' || ss -ln 2>/dev/null | grep ':$REVERSE_PORT ' || echo 'AVAILABLE'" 2>/dev/null)
 
-if command -v ss >/dev/null 2>&1; then
-    log "Using ss..."
-    PIDS=$(ss -lptn "sport = :$PORT" 2>/dev/null | grep -o "pid=[0-9]*" | cut -d= -f2)
-    if [ -n "$PIDS" ]; then
-        echo "$PIDS" | while read -r pid; do
-            log "Killing PID: $pid"
-            kill "$pid" 2>/dev/null
-        done
-    fi
-    log "ss completed"
-    exit 0
-fi
-
-if command -v netstat >/dev/null 2>&1; then
-    log "Using netstat..."
-    PIDS=$(netstat -lnp 2>/dev/null | grep ":$PORT " | awk "{print \$7}" | cut -d/ -f1)
-    if [ -n "$PIDS" ]; then
-        echo "$PIDS" | while read -r pid; do
-            [ -n "$pid" ] && log "Killing PID: $pid" && kill "$pid" 2>/dev/null
-        done
-    fi
-    log "netstat completed"
-    exit 0
-fi
-
-log "No cleanup tools available"
-'
+if echo "$PORT_CHECK" | grep -q "AVAILABLE"; then
+    log_success "Port $REVERSE_PORT is available"
+elif echo "$PORT_CHECK" | grep -q ":$REVERSE_PORT"; then
+    log_error "Port $REVERSE_PORT is ALREADY IN USE on remote server!"
+    log_error "Output: $PORT_CHECK"
+    log_info "Attempting to kill processes..."
     
     ssh -o BatchMode=yes \
-        -o ConnectTimeout=10 \
         -o StrictHostKeyChecking=yes \
         -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" \
         -p "$TARGET_PORT" \
         -i "$KEY_PATH" \
         "$TARGET_USER@$TARGET_IP" \
-        "bash -s -- $REVERSE_PORT" <<< "$CLEANUP_SCRIPT" 2>&1 | while read -r line; do
-            log_debug "Remote cleanup: $line"
-        done
+        "fuser -k $REVERSE_PORT/tcp 2>/dev/null || lsof -ti:$REVERSE_PORT | xargs kill -9 2>/dev/null || true" 2>/dev/null
     
     sleep 2
-    
+else
+    log_warn "Could not determine port status (assuming available)"
+fi
+
+log_info "3. Checking GatewayPorts setting..."
+GATEWAY_PORTS=$(ssh -o BatchMode=yes \
+                    -o StrictHostKeyChecking=yes \
+                    -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" \
+                    -p "$TARGET_PORT" \
+                    -i "$KEY_PATH" \
+                    "$TARGET_USER@$TARGET_IP" \
+                    "grep -i '^GatewayPorts' /etc/ssh/sshd_config 2>/dev/null || echo 'NOT_SET'" 2>/dev/null)
+
+log_debug "GatewayPorts config: $GATEWAY_PORTS"
+
+if echo "$GATEWAY_PORTS" | grep -qi "yes\|clientspecified"; then
+    log_success "GatewayPorts is enabled"
+elif echo "$GATEWAY_PORTS" | grep -qi "NOT_SET"; then
+    log_warn "GatewayPorts not explicitly set (defaults to 'no')"
+    log_warn "Binding to 127.0.0.1 only (localhost)"
+else
+    log_warn "GatewayPorts may be disabled"
+fi
+
+log_info "4. Testing reverse tunnel with verbose output..."
+log_warn "Starting SSH with -v flag for 10 seconds..."
+
+VERBOSE_LOG=$(mktemp)
+timeout 10 ssh -v -N \
+    -R "127.0.0.1:$REVERSE_PORT:127.0.0.1:22" \
+    -o StrictHostKeyChecking=yes \
+    -o UserKnownHostsFile="$KNOWN_HOSTS_FILE" \
+    -p "$TARGET_PORT" \
+    -i "$KEY_PATH" \
+    "$TARGET_USER@$TARGET_IP" > "$VERBOSE_LOG" 2>&1 || true
+
+echo ""
+echo "========== SSH VERBOSE OUTPUT =========="
+cat "$VERBOSE_LOG"
+echo "========================================"
+echo ""
+
+if grep -qi "remote port forwarding failed\|cannot listen to port\|bind.*failed" "$VERBOSE_LOG"; then
+    log_error "Port binding failed on remote server!"
+    log_error "Possible causes:"
+    log_error "  1. Port $REVERSE_PORT already in use"
+    log_error "  2. GatewayPorts disabled (edit /etc/ssh/sshd_config)"
+    log_error "  3. Firewall blocking the port"
+    rm -f "$VERBOSE_LOG"
+    exit 1
+fi
+
+if grep -qi "forwarding.*bound" "$VERBOSE_LOG"; then
+    log_success "Tunnel CAN be established!"
+else
+    log_warn "Could not confirm tunnel establishment from logs"
+fi
+
+rm -f "$VERBOSE_LOG"
+
+log_info "Diagnostics complete. Starting persistent tunnel..."
+sleep 2
+
+RETRY_COUNT=0
+MAX_RETRIES=10
+
+while true; do
     log_info "Establishing tunnel (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
-    log_debug "Command: ssh -N -R 127.0.0.1:$REVERSE_PORT:127.0.0.1:22 -D 127.0.0.1:$SOCKS_PORT"
     
     ssh -N \
         -R "127.0.0.1:$REVERSE_PORT:127.0.0.1:22" \
@@ -349,35 +356,27 @@ log "No cleanup tools available"
         "$TARGET_USER@$TARGET_IP" &
     
     SSH_PID=$!
-    log_debug "SSH tunnel started with PID: $SSH_PID"
     
     sleep 5
     
     if ! kill -0 "$SSH_PID" 2>/dev/null; then
         RETRY_COUNT=$((RETRY_COUNT + 1))
-        log_error "Tunnel process died immediately (PID $SSH_PID no longer exists)"
+        log_error "Tunnel failed (PID $SSH_PID died)"
         
         if [ "$RETRY_COUNT" -ge "$MAX_RETRIES" ]; then
-            log_error "Max retries ($MAX_RETRIES) reached. Giving up."
-            log_error "Possible causes:"
-            log_error "  1. Port $REVERSE_PORT already in use on remote"
-            log_error "  2. GatewayPorts disabled in sshd_config"
-            log_error "  3. Network connectivity issues"
+            log_error "Max retries reached. Exiting."
             exit 1
         fi
         
-        log_warn "Retrying in 10 seconds... ($RETRY_COUNT/$MAX_RETRIES)"
+        log_warn "Retrying in 10 seconds..."
         sleep 10
         continue
     fi
     
-    log_success "Tunnel established successfully (PID: $SSH_PID)"
+    log_success "Tunnel established (PID: $SSH_PID)"
     RETRY_COUNT=0
     
-    wait "$SSH_PID" 2>/dev/null || {
-        EXIT_CODE=$?
-        log_debug "SSH process exited with code: $EXIT_CODE"
-    }
+    wait "$SSH_PID" 2>/dev/null || true
     
     log_warn "Tunnel disconnected. Reconnecting in 5 seconds..."
     sleep 5
