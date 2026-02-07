@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Persistent SSH Reverse Tunnel Manager v3.1.0 (Smart Re-Auth)
+# Persistent SSH Reverse Tunnel Manager v3.2.0 (Auto-Clean & Smart Auth)
 # ==============================================================================
 set -u
 
-VERSION="3.1.0"
+VERSION="3.2.0"
 # [IMPORTANT] REPLACE WITH YOUR RAW GITHUB URL
 UPDATE_URL="https://raw.githubusercontent.com/dazaiop853-afk/tunnel-tool/main/tunnel.sh"
 
@@ -21,9 +21,6 @@ REVERSE_PORT=2222
 SOCKS_PORT=1080
 
 # --- NUCLEAR SSH OPTIONS ---
-# -F /dev/null:    Ignore user's ~/.ssh/config entirely (Fixes Multiplexing/ControlMaster issues)
-# -S none:         Disable socket sharing explicitly
-# -o Ident...:     Force only our specific key
 SSH_OPTS="-F /dev/null -S none -o ControlMaster=no -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$KNOWN_HOSTS_FILE -o IdentitiesOnly=yes"
 
 # Colors
@@ -86,10 +83,6 @@ if [ ! -f "$KEY_PATH" ]; then
 fi
 
 # --- Smart Reachability Check ---
-# Returns:
-# 0 = Fully Authorized (Ready to tunnel)
-# 2 = Reachable but Unauthorized (Needs Key Copy)
-# 1 = Unreachable (Network/Firewall issue)
 check_status() {
     local ip=$1; local port=$2; local user=$3
     printf "Testing %s@%s:%s ... " "$user" "$ip" "$port"
@@ -100,11 +93,9 @@ check_status() {
     fi
     
     # 2. Try Password Auth (Repair case)
-    # We override IdentitiesOnly to allow password fallback check
     local output
     output=$(ssh -F /dev/null -o UserKnownHostsFile=$KNOWN_HOSTS_FILE -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=5 -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive -p "$port" "$user@$ip" exit 2>&1) || true
     
-    # If we get "Permission denied", the server IS reachable, just needs keys.
     if echo "$output" | grep -qE "Permission denied|publickey|password"; then
         echo -e "${YELLOW}Needs Auth${NC}"; return 2
     fi
@@ -116,10 +107,7 @@ copy_ssh_id() {
     local user=$1; local ip=$2; local port=$3
     log_warn "Access denied. Attempting to repair keys..."
     log_info "Please enter the server password:"
-    
-    # Fallback pipe method for cross-platform compatibility
     cat "${KEY_PATH}.pub" | ssh -F /dev/null -o UserKnownHostsFile=$KNOWN_HOSTS_FILE -o StrictHostKeyChecking=accept-new -p "$port" "$user@$ip" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
-    
     return $?
 }
 
@@ -127,17 +115,13 @@ copy_ssh_id() {
 TARGET_IP=""
 if [ -f "$CONFIG_FILE" ]; then
     IFS=':' read -r SIP SPORT SUSER < "$CONFIG_FILE"
-    
-    # Check the saved IP
     check_status "$SIP" "$SPORT" "$SUSER"
     STATUS=$?
     
     if [ $STATUS -eq 0 ]; then
-        # All good
         TARGET_IP="$SIP"; TARGET_PORT="$SPORT"; TARGET_USER="$SUSER"
         log_success "Loaded from config: $TARGET_IP"
     elif [ $STATUS -eq 2 ]; then
-        # Reachable, but keys missing (Server wiped?) -> REPAIR IT
         if copy_ssh_id "$SUSER" "$SIP" "$SPORT"; then
             TARGET_IP="$SIP"; TARGET_PORT="$SPORT"; TARGET_USER="$SUSER"
             log_success "Access repaired."
@@ -146,7 +130,6 @@ if [ -f "$CONFIG_FILE" ]; then
             TARGET_IP=""
         fi
     else
-        # Unreachable
         log_warn "Saved IP unreachable. Switch to manual."
         TARGET_IP=""
     fi
@@ -155,15 +138,11 @@ fi
 # --- 2. Manual Entry Loop ---
 while [ -z "${TARGET_IP:-}" ]; do
     read -p "Enter server IP: " INPUT_IP
-    
     check_status "$INPUT_IP" "$TARGET_PORT" "$TARGET_USER"
     STATUS=$?
-    
     if [ $STATUS -eq 0 ]; then
-        # Already good (rare for new IP, but possible)
         TARGET_IP="$INPUT_IP"
     elif [ $STATUS -eq 2 ]; then
-        # Reachable, needs keys -> Install them
         if copy_ssh_id "$TARGET_USER" "$INPUT_IP" "$TARGET_PORT"; then
             TARGET_IP="$INPUT_IP"
         fi
@@ -171,15 +150,23 @@ while [ -z "${TARGET_IP:-}" ]; do
     
     if [ -n "$TARGET_IP" ]; then
         echo "${TARGET_IP}:${TARGET_PORT}:${TARGET_USER}" > "$CONFIG_FILE"
-        log_success "Configuration saved to $CONFIG_FILE"
+        log_success "Configuration saved."
     fi
 done
 
-# --- Cleanup Generator ---
+# --- Cleanup Generator (Now with Auto-Wipe!) ---
 get_cleanup_cmd() {
     cat <<'CLEANUP_SCRIPT'
     PORT=$1
     [ -z "$PORT" ] && exit 1
+    
+    # 1. Clean Known Hosts (The Fix)
+    # This prevents the "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!" error
+    if command -v ssh-keygen >/dev/null 2>&1; then
+        ssh-keygen -f "$HOME/.ssh/known_hosts" -R "[127.0.0.1]:$PORT" >/dev/null 2>&1
+    fi
+    
+    # 2. Kill Zombie Ports
     if command -v fuser >/dev/null 2>&1; then fuser -k -n tcp "$PORT"; exit 0; fi
     if command -v lsof >/dev/null 2>&1; then lsof -t -i:"$PORT" | xargs -r kill 2>/dev/null; exit 0; fi
     if command -v ss >/dev/null 2>&1; then
@@ -197,12 +184,12 @@ read -p "Continue? (yes/no): " C; [ "$C" != "yes" ] && exit 1
 # --- Tunnel Loop ---
 echo "=============================================="
 echo "  Remote: $TARGET_USER@$TARGET_IP:$TARGET_PORT"
-echo "  Version: $VERSION (Smart Re-Auth)"
+echo "  Version: $VERSION (Auto-Clean & Smart Auth)"
 echo "=============================================="
 
 while true; do
     log_info "Cleaning remote port $REVERSE_PORT..."
-    # 1. Clean Port
+    # 1. Clean Port (Executes the Auto-Wipe)
     ssh $SSH_OPTS -p "$TARGET_PORT" -i "$KEY_PATH" "$TARGET_USER@$TARGET_IP" \
         "bash -s -- $REVERSE_PORT" <<< "$(get_cleanup_cmd)" 2>/dev/null || true
     
