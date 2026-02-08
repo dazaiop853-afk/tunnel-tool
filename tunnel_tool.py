@@ -669,16 +669,16 @@ def print_success_banner(relay_ip, relay_user, field_user,
         print(f"\n  {C.YELLOW}export all_proxy=socks5h://127.0.0.1:{SOCKS_PROXY_PORT}")
         print(f"  curl ifconfig.me{C.RESET}")
     print(f"\n{C.GREEN}{C.BOLD}{'='*62}{C.RESET}\n")
-
 def generate_ssh_config(relay_ip, relay_user, field_user, iran_ip, iran_user):
-    step("Generating Efficient SSH Config")
+    step("Generating Smart SSH Config")
     
-    # Just set the vars. The proxy is already provided by the Python script backbone.
+    # This command runs AUTOMATICALLY when you log in.
+    # It sets the shell to use the port 1080 SOCKS proxy (which we opened in establish_reverse_tunnel).
     proxy_cmd = (
         "export all_proxy=socks5h://127.0.0.1:1080; "
         "export http_proxy=socks5h://127.0.0.1:1080; "
         "export https_proxy=socks5h://127.0.0.1:1080; "
-        "echo '>> ⚡️ UNFILTERED SHELL (Exit Node: Germany Relay)'; "
+        "echo '>> ⚡️ UNFILTERED SHELL (Traffic routed via Germany)'; "
         "exec bash -l"
     )
 
@@ -704,6 +704,7 @@ Host field-unit
     ServerAliveInterval {SSH_ALIVE_INTERVAL}
     ServerAliveCountMax {SSH_ALIVE_COUNT_MAX}
 
+# THE FIX: Use RemoteCommand to set env vars on the server
 Host field-unit-unfiltered
     HostName localhost
     Port {REVERSE_TUNNEL_PORT}
@@ -713,8 +714,9 @@ Host field-unit-unfiltered
     UserKnownHostsFile {KNOWN_HOSTS_FILE}
     RequestTTY force
     RemoteCommand {proxy_cmd}
+
 """
-    # (... rest of the function remains the same ...)
+
     if iran_ip:
         snippet += f"""
 Host iran-server
@@ -730,25 +732,30 @@ Host iran-server-unfiltered
     ProxyJump field-unit
     IdentityFile {LOCAL_KEY_PATH}
     UserKnownHostsFile {KNOWN_HOSTS_FILE}
-    # For node D, we DO need RemoteForward because it doesn't have the backbone connection
-    # This tunnels Node D traffic back to Node C (Field Unit), which then goes to Germany.
+    # For Node D, we tunnel back to Node C's proxy
     RemoteForward 1080 127.0.0.1:1080
     RequestTTY force
     RemoteCommand {proxy_cmd}
 """
 
     snippet += "# --- End TunnelTool Config ---\n"
-    
-    # ... (file writing logic matches previous) ...
+
     ssh_cfg = Path.home() / ".ssh" / "config"
     ssh_cfg.parent.mkdir(parents=True, exist_ok=True)
+    
     if ssh_cfg.exists():
         content = ssh_cfg.read_text()
-        content = re.sub(r'# --- TunnelTool Generated Config ---.*?# --- End TunnelTool Config ---\n', '', content, flags=re.DOTALL)
-    else: content = ""
+        content = re.sub(r'# --- TunnelTool Generated Config ---.*?# --- End TunnelTool Config ---\n',
+                         '', content, flags=re.DOTALL)
+    else:
+        content = ""
+
     ssh_cfg.write_text(content + snippet)
     os.chmod(ssh_cfg, 0o600)
+    
     info("SSH config updated.")
+    print(f"    1. {C.YELLOW}ssh field-unit{C.RESET}             (Filtered / Normal)")
+    print(f"    2. {C.YELLOW}ssh field-unit-unfiltered{C.RESET}  (Unfiltered / Proxy Auto-Set)")
 
 # ---- MAIN ORCHESTRATOR ----
 
