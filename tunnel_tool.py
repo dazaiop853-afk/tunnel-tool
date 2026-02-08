@@ -669,11 +669,11 @@ def print_success_banner(relay_ip, relay_user, field_user,
         print(f"\n  {C.YELLOW}export all_proxy=socks5h://127.0.0.1:{SOCKS_PROXY_PORT}")
         print(f"  curl ifconfig.me{C.RESET}")
     print(f"\n{C.GREEN}{C.BOLD}{'='*62}{C.RESET}\n")
+                           
 def generate_ssh_config(relay_ip, relay_user, field_user, iran_ip, iran_user):
     step("Generating Smart SSH Config")
     
-    # This command runs AUTOMATICALLY when you log in.
-    # It sets the shell to use the port 1080 SOCKS proxy (which we opened in establish_reverse_tunnel).
+    # 1. The command to enable proxy env vars on the remote shell
     proxy_cmd = (
         "export all_proxy=socks5h://127.0.0.1:1080; "
         "export http_proxy=socks5h://127.0.0.1:1080; "
@@ -703,8 +703,9 @@ Host field-unit
     UserKnownHostsFile {KNOWN_HOSTS_FILE}
     ServerAliveInterval {SSH_ALIVE_INTERVAL}
     ServerAliveCountMax {SSH_ALIVE_COUNT_MAX}
+    # Link Local:1080 -> FieldUnit:1080 so we can chain it to Iran Server
+    LocalForward 1080 127.0.0.1:1080
 
-# THE FIX: Use RemoteCommand to set env vars on the server
 Host field-unit-unfiltered
     HostName localhost
     Port {REVERSE_TUNNEL_PORT}
@@ -717,6 +718,7 @@ Host field-unit-unfiltered
 
 """
 
+    # Only add Iran Server if the IP exists
     if iran_ip:
         snippet += f"""
 Host iran-server
@@ -732,7 +734,7 @@ Host iran-server-unfiltered
     ProxyJump field-unit
     IdentityFile {LOCAL_KEY_PATH}
     UserKnownHostsFile {KNOWN_HOSTS_FILE}
-    # For Node D, we tunnel back to Node C's proxy
+    # Chain: IranServer:1080 -> Local:1080 -> FieldUnit:1080 -> Relay
     RemoteForward 1080 127.0.0.1:1080
     RequestTTY force
     RemoteCommand {proxy_cmd}
@@ -754,8 +756,11 @@ Host iran-server-unfiltered
     os.chmod(ssh_cfg, 0o600)
     
     info("SSH config updated.")
-    print(f"    1. {C.YELLOW}ssh field-unit{C.RESET}             (Filtered / Normal)")
-    print(f"    2. {C.YELLOW}ssh field-unit-unfiltered{C.RESET}  (Unfiltered / Proxy Auto-Set)")
+    print(f"    1. {C.YELLOW}ssh field-unit{C.RESET}             (Node C - Filtered)")
+    print(f"    2. {C.YELLOW}ssh field-unit-unfiltered{C.RESET}  (Node C - Unfiltered)")
+    if iran_ip:
+        print(f"    3. {C.YELLOW}ssh iran-server{C.RESET}            (Node D - Filtered)")
+        print(f"    4. {C.YELLOW}ssh iran-server-unfiltered{C.RESET} (Node D - Unfiltered)")
 
 # ---- MAIN ORCHESTRATOR ----
 
