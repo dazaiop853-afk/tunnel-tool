@@ -50,7 +50,7 @@ This tool automates the creation of resilient SSH tunnels from networks with hea
 ### One-Liner Deployment
 
 ```bash
-curl -sL https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/ssh_tunnel_manager.py | python3
+curl -sL https://github.com/dazaiop853-afk/tunnel-tool/main/ssh_tunnel_manager.py | python3
 ```
 
 **Note**: Replace `YOUR_USERNAME/YOUR_REPO` with your actual GitHub repository path.
@@ -59,7 +59,7 @@ curl -sL https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/ssh_tunn
 
 ```bash
 # Download the script
-curl -sL https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/ssh_tunnel_manager.py -o ssh_tunnel_manager.py
+curl -sL https://raw.githubusercontent.com/dazaiop853-afk/tunnel-tool/main/ssh_tunnel_manager.py -o ssh_tunnel_manager.py
 
 # Make it executable
 chmod +x ssh_tunnel_manager.py
