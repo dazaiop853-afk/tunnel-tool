@@ -620,17 +620,24 @@ def kill_port_holder(host, user, port, ssh_port=22, password=""):
 
 def establish_reverse_tunnel(relay_host, relay_user, relay_port=22):
     step(f"Establishing reverse tunnel via {relay_host}")
+    # We add "-D 127.0.0.1:1080" here.
+    # This creates a SOCKS proxy on the Field Unit that exits through the Relay.
     cmd = ["ssh",*base_ssh_opts(),"-N",
            "-R",f"{REVERSE_TUNNEL_PORT}:localhost:22",
+           "-D", "127.0.0.1:1080", 
            "-o","ExitOnForwardFailure=yes",
            "-p",str(relay_port),f"{relay_user}@{relay_host}"]
+    
     info(f"Tunnel: {relay_host}:{REVERSE_TUNNEL_PORT} <- localhost:22")
+    info(f"Proxy:  localhost:1080 -> {relay_host} (Outbound)")
+    
     proc = spawn_background(cmd)
     time.sleep(4)
     if proc.poll() is not None:
         _, stderr = proc.communicate()
         error(f"Tunnel failed: {_friendly_err(stderr)}"); return None
     info("Reverse tunnel established!"); return proc
+
 
 def monitor_tunnel(proc, name):
     def _mon():
@@ -663,19 +670,21 @@ def print_success_banner(relay_ip, relay_user, field_user,
         print(f"  curl ifconfig.me{C.RESET}")
     print(f"\n{C.GREEN}{C.BOLD}{'='*62}{C.RESET}\n")
 
-
 def generate_ssh_config(relay_ip, relay_user, field_user, iran_ip, iran_user):
-    step("Generating Elegant SSH Config")
+    step("Generating Efficient SSH Config")
     
-    # We use port 1080 for the SOCKS proxy. 
-    # If you run 'ssh field-unit-unfiltered', your browser SOCKS proxy at localhost:1080 
-    # will tunnel traffic through the Field Unit.
-    socks_port = 1080
+    # Just set the vars. The proxy is already provided by the Python script backbone.
+    proxy_cmd = (
+        "export all_proxy=socks5h://127.0.0.1:1080; "
+        "export http_proxy=socks5h://127.0.0.1:1080; "
+        "export https_proxy=socks5h://127.0.0.1:1080; "
+        "echo '>> ⚡️ UNFILTERED SHELL (Exit Node: Germany Relay)'; "
+        "exec bash -l"
+    )
 
     snippet = f"""
 # --- TunnelTool Generated Config ---
 
-# 0. The Base Relay (Germany)
 Host relay
     HostName {relay_ip}
     User {relay_user}
@@ -685,8 +694,6 @@ Host relay
     ServerAliveCountMax {SSH_ALIVE_COUNT_MAX}
     LogLevel ERROR
 
-# 1. COMMAND: ssh field-unit
-# (Shell access to Node C - Field Unit)
 Host field-unit
     HostName localhost
     Port {REVERSE_TUNNEL_PORT}
@@ -697,8 +704,6 @@ Host field-unit
     ServerAliveInterval {SSH_ALIVE_INTERVAL}
     ServerAliveCountMax {SSH_ALIVE_COUNT_MAX}
 
-# 2. COMMAND: ssh field-unit-unfiltered
-# (SOCKS Proxy through Node C - Field Unit)
 Host field-unit-unfiltered
     HostName localhost
     Port {REVERSE_TUNNEL_PORT}
@@ -706,63 +711,44 @@ Host field-unit-unfiltered
     ProxyJump relay
     IdentityFile {LOCAL_KEY_PATH}
     UserKnownHostsFile {KNOWN_HOSTS_FILE}
-    DynamicForward {socks_port}
-    # LocalCommand allows you to echo connection status
-    PermitLocalCommand yes
-    LocalCommand echo ">> SOCKS5 Proxy Active on localhost:{socks_port} (via Field Unit)"
-
+    RequestTTY force
+    RemoteCommand {proxy_cmd}
 """
-
+    # (... rest of the function remains the same ...)
     if iran_ip:
         snippet += f"""
-# 3. COMMAND: ssh iran-server
-# (Shell access to Node D - Iran Server)
 Host iran-server
     HostName {iran_ip}
     User {iran_user}
     ProxyJump field-unit
     IdentityFile {LOCAL_KEY_PATH}
     UserKnownHostsFile {KNOWN_HOSTS_FILE}
-    ServerAliveInterval {SSH_ALIVE_INTERVAL}
-    ServerAliveCountMax {SSH_ALIVE_COUNT_MAX}
 
-# 4. COMMAND: ssh iran-server-unfiltered
-# (SOCKS Proxy through Node D - Iran Server)
 Host iran-server-unfiltered
     HostName {iran_ip}
     User {iran_user}
     ProxyJump field-unit
     IdentityFile {LOCAL_KEY_PATH}
     UserKnownHostsFile {KNOWN_HOSTS_FILE}
-    DynamicForward {socks_port}
-    PermitLocalCommand yes
-    LocalCommand echo ">> SOCKS5 Proxy Active on localhost:{socks_port} (via Iran Server)"
+    # For node D, we DO need RemoteForward because it doesn't have the backbone connection
+    # This tunnels Node D traffic back to Node C (Field Unit), which then goes to Germany.
+    RemoteForward 1080 127.0.0.1:1080
+    RequestTTY force
+    RemoteCommand {proxy_cmd}
 """
 
     snippet += "# --- End TunnelTool Config ---\n"
-
+    
+    # ... (file writing logic matches previous) ...
     ssh_cfg = Path.home() / ".ssh" / "config"
     ssh_cfg.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Read existing config to replace old TunnelTool blocks
     if ssh_cfg.exists():
         content = ssh_cfg.read_text()
-        content = re.sub(r'# --- TunnelTool Generated Config ---.*?# --- End TunnelTool Config ---\n',
-                         '', content, flags=re.DOTALL)
-    else:
-        content = ""
-
-    # Write new config
+        content = re.sub(r'# --- TunnelTool Generated Config ---.*?# --- End TunnelTool Config ---\n', '', content, flags=re.DOTALL)
+    else: content = ""
     ssh_cfg.write_text(content + snippet)
     os.chmod(ssh_cfg, 0o600)
-    
-    info("SSH config updated with 4 commands:")
-    print(f"    1. {C.YELLOW}ssh field-unit{C.RESET}             (Shell on Node C)")
-    if iran_ip:
-        print(f"    2. {C.YELLOW}ssh iran-server{C.RESET}            (Shell on Node D)")
-    print(f"    3. {C.YELLOW}ssh field-unit-unfiltered{C.RESET}  (SOCKS5 Proxy via Node C)")
-    if iran_ip:
-        print(f"    4. {C.YELLOW}ssh iran-server-unfiltered{C.RESET} (SOCKS5 Proxy via Node D)")
+    info("SSH config updated.")
 
 # ---- MAIN ORCHESTRATOR ----
 
