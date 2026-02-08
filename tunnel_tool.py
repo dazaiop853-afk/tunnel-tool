@@ -842,7 +842,7 @@ def main():
         jump_cmd = ["ssh",*base_ssh_opts(),"-o","BatchMode=yes",
                     "-J",f"{relay_user}@{relay_ip}","-p",str(REVERSE_TUNNEL_PORT),
                     f"{field_user}@localhost","echo OK"]
-        rc, stdout, _ = run_cmd(jump_cmd, timeout=30)
+        rc, stdout, _ = run_cmd(jump_cmd, timeout=45)
         if rc != 0 or "OK" not in (stdout or ""):
             warn("Cannot reach Field Unit with keys. Setting up cross-node keying...")
             relay_pub = ensure_remote_key(relay_ip, relay_user, password=relay_pw)
@@ -852,20 +852,31 @@ def main():
                 # Ensure sshpass on relay
                 dim("Ensuring sshpass on relay...")
                 remote_exec(relay_ip, relay_user,
-                    "which sshpass >/dev/null 2>&1 || (apt-get install -y sshpass 2>/dev/null || yum install -y sshpass 2>/dev/null)")
-                for pub, label in [(relay_pub, "relay"), (local_pub, "local")]:
-                    escaped = pub.replace('"', '\\"').replace("'", "'\\''")
-                    inject = (f"mkdir -p ~/.ssh && chmod 700 ~/.ssh && "
-                              f"grep -qF '{pub}' ~/.ssh/authorized_keys 2>/dev/null || "
-                              f"echo '{pub}' >> ~/.ssh/authorized_keys && "
-                              f"chmod 600 ~/.ssh/authorized_keys")
-                    relay_run = (f'sshpass -p "{field_pw}" ssh -o StrictHostKeyChecking=accept-new '
-                                 f'-o UserKnownHostsFile=~/.ssh/{TOOL_NAME}_known_hosts '
-                                 f'-o PubkeyAuthentication=no '
-                                 f'-p {REVERSE_TUNNEL_PORT} {field_user}@localhost "{inject}"')
-                    rc2, _, err2 = remote_exec(relay_ip, relay_user, relay_run, timeout=30)
-                    if rc2 == 0: info(f"{label} key pushed to Field Unit")
-                    else: warn(f"{label} key push may have failed: {err2[:80] if err2 else 'unknown'}")
+                    "which sshpass >/dev/null 2>&1 || (apt-get install -y sshpass 2>/dev/null || yum install -y sshpass 2>/dev/null)",
+                    timeout=60)
+                # Push BOTH keys in a single SSH session to avoid double-timeout
+                all_keys = relay_pub + "\n" + local_pub
+                inject_both = (
+                    f"mkdir -p ~/.ssh && chmod 700 ~/.ssh && "
+                    f"echo '{relay_pub}' >> ~/.ssh/authorized_keys && "
+                    f"echo '{local_pub}' >> ~/.ssh/authorized_keys && "
+                    f"sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys && "
+                    f"chmod 600 ~/.ssh/authorized_keys && echo KEYSDONE"
+                )
+                relay_run = (
+                    f'sshpass -p "{field_pw}" ssh '
+                    f'-o StrictHostKeyChecking=accept-new '
+                    f'-o UserKnownHostsFile=~/.ssh/{TOOL_NAME}_known_hosts '
+                    f'-o PubkeyAuthentication=no '
+                    f'-o ConnectTimeout=30 '
+                    f'-p {REVERSE_TUNNEL_PORT} {field_user}@localhost '
+                    f'"{inject_both}"'
+                )
+                rc2, out2, err2 = remote_exec(relay_ip, relay_user, relay_run, timeout=60)
+                if rc2 == 0 and "KEYSDONE" in out2:
+                    info("Both keys (relay + local) pushed to Field Unit")
+                else:
+                    warn(f"Key push may have failed: {err2[:120] if err2 else out2[:120] if out2 else 'timeout'}")
         else: info("Field Unit reachable with keys through relay")
 
         # Phase 7: Iran Server (Node D)
