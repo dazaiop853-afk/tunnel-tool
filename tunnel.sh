@@ -19,8 +19,8 @@ Goal 2: A → B → C → D  (chain through field unit to Iran server)
 """
 
 __version__ = "1.0.0"
-__source_url__ = "https://raw.githubusercontent.com/dazaiop853-afk/tunneltool/main/tunnel_tool.py"
-__cdn_url__ = "https://cdn.jsdelivr.net/gh/dazaiop853-afk/tunneltool@main/tunnel_tool.py"
+__source_url__ = "https://raw.githubusercontent.com/dazaiop853-afk/tunneltool/main/tunnel.py"
+__cdn_url__ = "https://cdn.jsdelivr.net/gh/dazaiop853-afk/tunneltool/tunnel.py"
 
 import sys
 import os
