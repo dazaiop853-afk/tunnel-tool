@@ -948,7 +948,9 @@ def main():
                 rc, fu_pub, _ = run_cmd(fu_keygen, timeout=30)
                 if rc == 0 and fu_pub.strip():
                     info("Field Unit key obtained")
-                    escaped = fu_pub.strip().replace("'", "'\\''")
+                    local_pub = get_pub_key()
+                    combined_keys = fu_pub.strip() + "\n" + local_pub.strip()
+                    escaped = combined_keys.replace("'", "'\\''")
                     push_iran = ["ssh",*base_ssh_opts(),"-J",f"{relay_user}@{relay_ip}",
                                  "-p",str(REVERSE_TUNNEL_PORT),f"{field_user}@localhost",
                                  (f'sshpass -p "{iran_pw}" ssh -o StrictHostKeyChecking=accept-new '
