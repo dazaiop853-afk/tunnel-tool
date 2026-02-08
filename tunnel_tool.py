@@ -663,10 +663,19 @@ def print_success_banner(relay_ip, relay_user, field_user,
         print(f"  curl ifconfig.me{C.RESET}")
     print(f"\n{C.GREEN}{C.BOLD}{'='*62}{C.RESET}\n")
 
-def generate_ssh_config(relay_ip, relay_user, field_user, iran_ip="", iran_user=""):
-    step("SSH Config Snippet (optional)")
+
+def generate_ssh_config(relay_ip, relay_user, field_user, iran_ip, iran_user):
+    step("Generating Elegant SSH Config")
+    
+    # We use port 1080 for the SOCKS proxy. 
+    # If you run 'ssh field-unit-unfiltered', your browser SOCKS proxy at localhost:1080 
+    # will tunnel traffic through the Field Unit.
+    socks_port = 1080
+
     snippet = f"""
 # --- TunnelTool Generated Config ---
+
+# 0. The Base Relay (Germany)
 Host relay
     HostName {relay_ip}
     User {relay_user}
@@ -674,7 +683,10 @@ Host relay
     UserKnownHostsFile {KNOWN_HOSTS_FILE}
     ServerAliveInterval {SSH_ALIVE_INTERVAL}
     ServerAliveCountMax {SSH_ALIVE_COUNT_MAX}
+    LogLevel ERROR
 
+# 1. COMMAND: ssh field-unit
+# (Shell access to Node C - Field Unit)
 Host field-unit
     HostName localhost
     Port {REVERSE_TUNNEL_PORT}
@@ -684,9 +696,27 @@ Host field-unit
     UserKnownHostsFile {KNOWN_HOSTS_FILE}
     ServerAliveInterval {SSH_ALIVE_INTERVAL}
     ServerAliveCountMax {SSH_ALIVE_COUNT_MAX}
+
+# 2. COMMAND: ssh field-unit-unfiltered
+# (SOCKS Proxy through Node C - Field Unit)
+Host field-unit-unfiltered
+    HostName localhost
+    Port {REVERSE_TUNNEL_PORT}
+    User {field_user}
+    ProxyJump relay
+    IdentityFile {LOCAL_KEY_PATH}
+    UserKnownHostsFile {KNOWN_HOSTS_FILE}
+    DynamicForward {socks_port}
+    # LocalCommand allows you to echo connection status
+    PermitLocalCommand yes
+    LocalCommand echo ">> SOCKS5 Proxy Active on localhost:{socks_port} (via Field Unit)"
+
 """
+
     if iran_ip:
         snippet += f"""
+# 3. COMMAND: ssh iran-server
+# (Shell access to Node D - Iran Server)
 Host iran-server
     HostName {iran_ip}
     User {iran_user}
@@ -695,22 +725,44 @@ Host iran-server
     UserKnownHostsFile {KNOWN_HOSTS_FILE}
     ServerAliveInterval {SSH_ALIVE_INTERVAL}
     ServerAliveCountMax {SSH_ALIVE_COUNT_MAX}
+
+# 4. COMMAND: ssh iran-server-unfiltered
+# (SOCKS Proxy through Node D - Iran Server)
+Host iran-server-unfiltered
+    HostName {iran_ip}
+    User {iran_user}
+    ProxyJump field-unit
+    IdentityFile {LOCAL_KEY_PATH}
+    UserKnownHostsFile {KNOWN_HOSTS_FILE}
+    DynamicForward {socks_port}
+    PermitLocalCommand yes
+    LocalCommand echo ">> SOCKS5 Proxy Active on localhost:{socks_port} (via Iran Server)"
 """
+
     snippet += "# --- End TunnelTool Config ---\n"
-    if ask_yes_no("Add aliases to ~/.ssh/config? (ssh field-unit / ssh iran-server)"):
-        ssh_cfg = Path.home() / ".ssh" / "config"
-        ssh_cfg.parent.mkdir(parents=True, exist_ok=True)
-        if ssh_cfg.exists():
-            content = ssh_cfg.read_text()
-            content = re.sub(r'# --- TunnelTool Generated Config ---.*?# --- End TunnelTool Config ---\n',
-                             '', content, flags=re.DOTALL)
-            ssh_cfg.write_text(content + snippet)
-        else: ssh_cfg.write_text(snippet)
-        os.chmod(ssh_cfg, 0o600)
-        info("SSH config updated:"); print(f"    {C.YELLOW}ssh field-unit{C.RESET}")
-        if iran_ip: print(f"    {C.YELLOW}ssh iran-server{C.RESET}")
+
+    ssh_cfg = Path.home() / ".ssh" / "config"
+    ssh_cfg.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Read existing config to replace old TunnelTool blocks
+    if ssh_cfg.exists():
+        content = ssh_cfg.read_text()
+        content = re.sub(r'# --- TunnelTool Generated Config ---.*?# --- End TunnelTool Config ---\n',
+                         '', content, flags=re.DOTALL)
     else:
-        info("Snippet (copy manually):"); print(f"{C.DIM}{snippet}{C.RESET}")
+        content = ""
+
+    # Write new config
+    ssh_cfg.write_text(content + snippet)
+    os.chmod(ssh_cfg, 0o600)
+    
+    info("SSH config updated with 4 commands:")
+    print(f"    1. {C.YELLOW}ssh field-unit{C.RESET}             (Shell on Node C)")
+    if iran_ip:
+        print(f"    2. {C.YELLOW}ssh iran-server{C.RESET}            (Shell on Node D)")
+    print(f"    3. {C.YELLOW}ssh field-unit-unfiltered{C.RESET}  (SOCKS5 Proxy via Node C)")
+    if iran_ip:
+        print(f"    4. {C.YELLOW}ssh iran-server-unfiltered{C.RESET} (SOCKS5 Proxy via Node D)")
 
 # ---- MAIN ORCHESTRATOR ----
 
