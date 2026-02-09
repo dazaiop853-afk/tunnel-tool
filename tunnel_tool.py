@@ -915,8 +915,8 @@ def main():
                 )
                 relay_run = (
                     f'sshpass -p "{field_pw}" ssh '
-                    f'-o StrictHostKeyChecking=accept-new '
-                    f'-o UserKnownHostsFile=~/.ssh/{TOOL_NAME}_known_hosts '
+                    f'-o StrictHostKeyChecking=no '
+                    f'-o UserKnownHostsFile=/dev/null '
                     f'-o PubkeyAuthentication=no '
                     f'-o ConnectTimeout=30 '
                     f'-p {REVERSE_TUNNEL_PORT} {field_user}@localhost '
