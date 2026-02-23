@@ -1,0 +1,606 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════════════════╗
+║           Germany Reverse Tunnel Manager v1.0                    ║
+║                                                                  ║
+║  Runs on Germany VPS. Dials Iran VPS, creates reverse tunnel     ║
+║  so Iran can use Germany as SOCKS5 exit node.                    ║
+║                                                                  ║
+║  Architecture:                                                   ║
+║    Germany (this) ──SSH──▶ Iran                                  ║
+║    Iran:3333 ◀── SOCKS5 ── Germany:3333                          ║
+║                                                                  ║
+║  Usage:                                                          ║
+║    python3 germany-tunnel-manager.py [--setup] [--status]        ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
+__version__ = "1.0.0"
+
+import sys, os, signal, subprocess, shutil, time, json, re
+import argparse, getpass, socket, threading, atexit, textwrap, pty
+import errno, select
+from pathlib import Path
+from typing import Optional
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+CONFIG_DIR        = Path.home() / ".germany-tunnel"
+CONFIG_FILE       = CONFIG_DIR / "config.json"
+KNOWN_HOSTS_FILE  = CONFIG_DIR / "known_hosts"
+KEY_NAME          = "id_rsa_tunnel"
+KEY_PATH          = CONFIG_DIR / KEY_NAME
+LOG_FILE          = CONFIG_DIR / "tunnel.log"
+
+IRAN_SOCKS_PORT   = 3333   # Port that appears on Iran as SOCKS5
+GERMANY_SOCKS_PORT= 3333   # Local SOCKS5 server on Germany (what Iran forwards to)
+SSH_KEEPALIVE     = 15
+SSH_KEEPALIVE_MAX = 3
+CONNECT_TIMEOUT   = 20
+HEALTH_INTERVAL   = 30     # Seconds between health checks
+MAX_RECONNECTS    = 0      # 0 = infinite
+
+CHILD_PROCS = []
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+class C:
+    R="\033[0m"; B="\033[1m"; RED="\033[91m"; GRN="\033[92m"
+    YLW="\033[93m"; BLU="\033[94m"; CYN="\033[96m"; DIM="\033[2m"
+
+def _log(level, msg):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOG_FILE, "a") as f:
+        f.write(f"[{ts}] [{level}] {msg}\n")
+
+def info(m):  print(f"  {C.GRN}✓{C.R} {m}");  _log("INFO",  m)
+def warn(m):  print(f"  {C.YLW}!{C.R} {m}");  _log("WARN",  m)
+def err(m):   print(f"  {C.RED}✗{C.R} {m}");  _log("ERROR", m)
+def step(m):  print(f"\n{C.BLU}{C.B}▶ {m}{C.R}")
+def dim(m):   print(f"  {C.DIM}{m}{C.R}")
+def ask(p, secret=False):
+    try:
+        if secret: return getpass.getpass(f"  {C.YLW}?{C.R} {p}: ")
+        return input(f"  {C.YLW}?{C.R} {p}: ").strip()
+    except EOFError: return ""
+def yn(p, default=True):
+    sfx = " [Y/n]: " if default else " [y/N]: "
+    try: r = input(f"  {C.YLW}?{C.R} {p}{sfx}").strip().lower()
+    except EOFError: return default
+    if r == "": return default
+    return r in ("y", "yes")
+
+# ── Cleanup ───────────────────────────────────────────────────────────────────
+def cleanup():
+    for p in CHILD_PROCS:
+        try: p.terminate(); p.wait(timeout=3)
+        except:
+            try: p.kill()
+            except: pass
+
+def _sig(signum, frame):
+    print(f"\n\n  {C.YLW}!{C.R}  Signal received. Shutting down...")
+    cleanup()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT,  _sig)
+signal.signal(signal.SIGTERM, _sig)
+atexit.register(cleanup)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+def load_cfg() -> dict:
+    if CONFIG_FILE.exists():
+        try: return json.loads(CONFIG_FILE.read_text())
+        except: return {}
+    return {}
+
+def save_cfg(cfg: dict):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+    _log("INFO", "Config saved")
+
+# ── SSH Helpers ───────────────────────────────────────────────────────────────
+def base_opts(use_key=True):
+    opts = [
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", f"UserKnownHostsFile={KNOWN_HOSTS_FILE}",
+        "-o", f"ServerAliveInterval={SSH_KEEPALIVE}",
+        "-o", f"ServerAliveCountMax={SSH_KEEPALIVE_MAX}",
+        "-o", f"ConnectTimeout={CONNECT_TIMEOUT}",
+        "-o", "LogLevel=ERROR",
+        "-o", "TCPKeepAlive=yes",
+    ]
+    if use_key: opts += ["-i", str(KEY_PATH)]
+    return opts
+
+def run(cmd, timeout=30, capture=True):
+    try:
+        p = subprocess.Popen(cmd,
+            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+            stderr=subprocess.PIPE if capture else subprocess.DEVNULL,
+            text=True)
+        out, err = p.communicate(timeout=timeout)
+        return p.returncode, out or "", err or ""
+    except subprocess.TimeoutExpired:
+        p.kill(); p.wait(); return -1, "", "timeout"
+    except Exception as e:
+        return -2, "", str(e)
+
+def pty_ssh(cmd, password, timeout=30):
+    """Run SSH with password via PTY (no sshpass needed)."""
+    chunks = []; pw_sent = False; master_fd = None
+    try:
+        master_fd, slave_fd = pty.openpty()
+        p = subprocess.Popen(cmd, stdin=slave_fd, stdout=slave_fd,
+                             stderr=slave_fd, close_fds=True, text=False)
+        CHILD_PROCS.append(p)
+        os.close(slave_fd)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            rem = deadline - time.time()
+            if rem <= 0: break
+            try: ready, _, _ = select.select([master_fd], [], [], min(rem, 0.5))
+            except (ValueError, OSError): break
+            if ready:
+                try: data = os.read(master_fd, 4096)
+                except OSError as e:
+                    if e.errno == errno.EIO: break
+                    raise
+                if not data: break
+                decoded = data.decode("utf-8", errors="replace")
+                chunks.append(decoded)
+                if not pw_sent and re.search(r'[Pp]ass(?:word|phrase)[^:]*:', decoded):
+                    time.sleep(0.1)
+                    os.write(master_fd, (password + "\n").encode())
+                    pw_sent = True
+            if p.poll() is not None:
+                try:
+                    while True:
+                        r, _, _ = select.select([master_fd], [], [], 0.2)
+                        if not r: break
+                        d = os.read(master_fd, 4096)
+                        if not d: break
+                        chunks.append(d.decode("utf-8", errors="replace"))
+                except OSError: pass
+                break
+        if p.poll() is None:
+            p.terminate()
+            try: p.wait(timeout=3)
+            except: p.kill(); p.wait()
+        full = "".join(chunks)
+        clean = "\n".join(l for l in full.split("\n")
+                          if password not in l and
+                          not re.search(r'[Pp]ass(?:word|phrase)[^:]*:', l)).strip()
+        return (p.returncode or 0), clean
+    except Exception as e:
+        return -1, str(e)
+    finally:
+        if master_fd:
+            try: os.close(master_fd)
+            except: pass
+
+def ssh_pw(cmd, password, timeout=30):
+    if shutil.which("sshpass"):
+        rc, out, _ = run(["sshpass", "-p", password] + cmd, timeout=timeout)
+        return rc, out
+    return pty_ssh(cmd, password, timeout)
+
+# ── Key Management ────────────────────────────────────────────────────────────
+def ensure_keys():
+    step("SSH Key Management")
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    pub = Path(str(KEY_PATH) + ".pub")
+    if KEY_PATH.exists() and pub.exists():
+        info(f"Keys exist: {KEY_PATH.name}"); return
+    info("Generating 4096-bit RSA key pair...")
+    rc, _, e = run(["ssh-keygen", "-t", "rsa", "-b", "4096",
+                    "-f", str(KEY_PATH), "-N", "",
+                    "-C", f"germany-tunnel@{socket.gethostname()}"], timeout=30)
+    if rc != 0: err(f"Key generation failed: {e}"); sys.exit(1)
+    os.chmod(KEY_PATH, 0o600)
+    info("Keys generated")
+
+def pub_key() -> str:
+    return Path(str(KEY_PATH) + ".pub").read_text().strip()
+
+def test_key_auth(host, user, port=22) -> bool:
+    cmd = ["ssh", *base_opts(), "-o", "BatchMode=yes",
+           "-p", str(port), f"{user}@{host}", "echo OK"]
+    rc, out, _ = run(cmd, timeout=CONNECT_TIMEOUT + 5)
+    return rc == 0 and "OK" in out
+
+def test_pw_auth(host, user, password, port=22) -> bool:
+    cmd = ["ssh", *base_opts(use_key=False),
+           "-o", "PubkeyAuthentication=no",
+           "-p", str(port), f"{user}@{host}", "echo OK"]
+    rc, out = ssh_pw(cmd, password, timeout=CONNECT_TIMEOUT + 10)
+    return rc == 0 and "OK" in out
+
+def copy_key(host, user, password, port=22) -> bool:
+    step(f"Copying public key to {user}@{host}:{port}")
+    pk = pub_key().replace('"', '\\"')
+    inject = (f'mkdir -p ~/.ssh && chmod 700 ~/.ssh && '
+              f'grep -qF "{pk}" ~/.ssh/authorized_keys 2>/dev/null || '
+              f'echo "{pk}" >> ~/.ssh/authorized_keys && '
+              f'chmod 600 ~/.ssh/authorized_keys && echo KEYDONE')
+    cmd = ["ssh", *base_opts(use_key=False),
+           "-o", "PubkeyAuthentication=no",
+           "-p", str(port), f"{user}@{host}", inject]
+    rc, out = ssh_pw(cmd, password, timeout=CONNECT_TIMEOUT + 15)
+    if rc == 0 and "KEYDONE" in out:
+        info("Public key installed on Iran"); return True
+    err(f"Key copy failed"); return False
+
+def remove_host_key(host, port=22):
+    target = f"[{host}]:{port}" if port != 22 else host
+    run(["ssh-keygen", "-f", str(KNOWN_HOSTS_FILE), "-R", target],
+        timeout=10, capture=True)
+
+# ── SOCKS5 Server (on Germany) ────────────────────────────────────────────────
+def start_socks_server() -> Optional[subprocess.Popen]:
+    """Start a SOCKS5 server on Germany that Iran will forward to."""
+    step("Starting SOCKS5 server on Germany")
+
+    # Prefer xray if available
+    if shutil.which("xray"):
+        cfg = {
+            "log": {"loglevel": "warning"},
+            "inbounds": [{"port": GERMANY_SOCKS_PORT, "listen": "127.0.0.1",
+                          "protocol": "socks", "settings": {"udp": False}}],
+            "outbounds": [{"protocol": "freedom"}]
+        }
+        cfg_path = CONFIG_DIR / "xray-socks.json"
+        cfg_path.write_text(json.dumps(cfg, indent=2))
+        p = subprocess.Popen(["xray", "-config", str(cfg_path)],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        CHILD_PROCS.append(p)
+        time.sleep(1)
+        if p.poll() is None:
+            info(f"SOCKS5 via Xray on 127.0.0.1:{GERMANY_SOCKS_PORT}"); return p
+
+    # Fallback: Python SOCKS5 server
+    info(f"SOCKS5 via Python on 127.0.0.1:{GERMANY_SOCKS_PORT}")
+    script = textwrap.dedent(f"""
+        import socket, threading, select, struct, errno
+
+        def forward(src, dst):
+            try:
+                while True:
+                    r, _, _ = select.select([src], [], [], 60)
+                    if not r: break
+                    d = src.recv(4096)
+                    if not d: break
+                    dst.sendall(d)
+            except: pass
+            finally:
+                for s in [src, dst]:
+                    try: s.close()
+                    except: pass
+
+        def handle(c):
+            try:
+                c.recv(256); c.send(b'\\x05\\x00')
+                data = c.recv(256)
+                if len(data) < 4: return
+                addr_type = data[3]
+                if addr_type == 1:
+                    host = socket.inet_ntoa(data[4:8])
+                    port = struct.unpack('!H', data[8:10])[0]
+                elif addr_type == 3:
+                    l = data[4]
+                    host = data[5:5+l].decode()
+                    port = struct.unpack('!H', data[5+l:7+l])[0]
+                else: c.close(); return
+                s = socket.create_connection((host, port), timeout=10)
+                c.send(b'\\x05\\x00\\x00\\x01\\x00\\x00\\x00\\x00\\x00\\x00')
+                threading.Thread(target=forward, args=(c, s), daemon=True).start()
+                threading.Thread(target=forward, args=(s, c), daemon=True).start()
+            except Exception as e:
+                try: c.close()
+                except: pass
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(('127.0.0.1', {GERMANY_SOCKS_PORT}))
+        srv.listen(128)
+        print('SOCKS5 ready', flush=True)
+        while True:
+            c, _ = srv.accept()
+            threading.Thread(target=handle, args=(c,), daemon=True).start()
+    """)
+    p = subprocess.Popen(["python3", "-c", script],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    CHILD_PROCS.append(p)
+    time.sleep(1)
+    if p.poll() is None: return p
+    err("SOCKS5 server failed to start"); return None
+
+# ── Reverse Tunnel ────────────────────────────────────────────────────────────
+def start_reverse_tunnel(iran_ip, iran_user, iran_port=22) -> Optional[subprocess.Popen]:
+    """Germany dials Iran. Creates Iran:IRAN_SOCKS_PORT → Germany SOCKS5."""
+    cmd = [
+        "ssh", *base_opts(), "-N",
+        "-R", f"127.0.0.1:{IRAN_SOCKS_PORT}:127.0.0.1:{GERMANY_SOCKS_PORT}",
+        "-o", "ExitOnForwardFailure=yes",
+        "-p", str(iran_port),
+        f"{iran_user}@{iran_ip}"
+    ]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    CHILD_PROCS.append(p)
+    time.sleep(4)
+    if p.poll() is not None:
+        _, e = p.communicate()
+        err(f"Tunnel failed: {e.strip()[:120]}"); return None
+    return p
+
+def check_tunnel_health(iran_ip, iran_user, iran_port=22) -> bool:
+    """Ask Iran to curl through port 3333. Should return Germany's IP."""
+    cmd = ["ssh", *base_opts(), "-o", "BatchMode=yes",
+           "-o", "ConnectTimeout=8",
+           "-p", str(iran_port), f"{iran_user}@{iran_ip}",
+           f"curl --socks5 127.0.0.1:{IRAN_SOCKS_PORT} --max-time 8 -s http://ip-api.com/line/?fields=query"]
+    rc, out, _ = run(cmd, timeout=20)
+    result = out.strip()
+    if rc == 0 and result and result != iran_ip:
+        _log("INFO", f"Health OK — Iran exits via {result}")
+        return True
+    return False
+
+# ── Email Alerts ──────────────────────────────────────────────────────────────
+def send_email(cfg, subject, body):
+    gmail = cfg.get("gmail_user","")
+    if not gmail: return
+    import smtplib, ssl
+    from email.message import EmailMessage
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"]    = gmail
+    msg["To"]      = cfg.get("alert_email", gmail)
+    msg.set_content(body)
+    try:
+        ctx = ssl.create_default_context()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx) as s:
+            s.login(gmail, cfg["gmail_app_pass"])
+            s.send_message(msg)
+        _log("INFO", f"Alert sent: {subject}")
+    except Exception as e:
+        _log("ERROR", f"Email failed: {e}")
+
+# ── Setup Wizard ──────────────────────────────────────────────────────────────
+def setup_wizard():
+    print(f"\n{C.CYN}{C.B}{'═'*60}")
+    print(f"  Germany Reverse Tunnel Manager — First-Time Setup")
+    print(f"{'═'*60}{C.R}\n")
+
+    cfg = load_cfg()
+
+    # Iran connection details
+    step("Iran VPS Credentials")
+    iran_ip   = ask(f"Iran VPS IP (current: {cfg.get('iran_ip','')})") or cfg.get("iran_ip","")
+    iran_user = ask(f"Iran SSH user (default: root)") or "root"
+    iran_port = int(ask("Iran SSH port (default: 22)") or 22)
+
+    # Test connectivity
+    dim(f"Testing {iran_user}@{iran_ip}:{iran_port} ...")
+
+    if test_key_auth(iran_ip, iran_user, iran_port):
+        info("Key auth already works — no password needed")
+        iran_pw = ""
+    else:
+        iran_pw = ask("Iran SSH password", secret=True)
+        if not test_pw_auth(iran_ip, iran_user, iran_pw, iran_port):
+            err("Cannot connect to Iran with that password"); sys.exit(1)
+        info("Password auth works")
+
+        # Copy key
+        if copy_key(iran_ip, iran_user, iran_pw, iran_port):
+            if test_key_auth(iran_ip, iran_user, iran_port):
+                info("Key auth now working — password no longer needed")
+                iran_pw = ""
+
+    # Email alerts (optional)
+    step("Email Alerts (optional — press Enter to skip)")
+    gmail = ask("Gmail address (leave blank to skip)")
+    gmail_pass = ""; alert_email = ""
+    if gmail:
+        gmail_pass  = ask("Gmail App Password", secret=True)
+        alert_email = ask(f"Alert destination email (default: {gmail})") or gmail
+
+    # Save config
+    cfg.update({
+        "iran_ip":       iran_ip,
+        "iran_user":     iran_user,
+        "iran_port":     iran_port,
+        "gmail_user":    gmail,
+        "gmail_app_pass":gmail_pass,
+        "alert_email":   alert_email,
+    })
+    save_cfg(cfg)
+
+    info("Setup complete — run without --setup to start tunnel")
+    return cfg
+
+# ── Status ────────────────────────────────────────────────────────────────────
+def show_status():
+    cfg = load_cfg()
+    if not cfg:
+        warn("Not configured yet. Run with --setup first."); return
+    print(f"\n{C.CYN}{C.B}  Germany Tunnel Manager — Status{C.R}")
+    print(f"  Iran target : {cfg.get('iran_user')}@{cfg.get('iran_ip')}:{cfg.get('iran_port',22)}")
+    print(f"  SOCKS port  : Iran:127.0.0.1:{IRAN_SOCKS_PORT} → Germany:{GERMANY_SOCKS_PORT}")
+    print(f"  Log file    : {LOG_FILE}")
+    print(f"  Config      : {CONFIG_FILE}")
+    # Check live tunnel
+    rc, out, _ = run(["pgrep", "-f", "germany-tunnel-manager"], timeout=5)
+    if rc == 0 and out.strip():
+        pids = [p for p in out.strip().split() if p != str(os.getpid())]
+        if pids: info(f"Tunnel manager running (pids: {', '.join(pids)})")
+        else: warn("No tunnel manager running")
+    else: warn("No tunnel manager running")
+    # Check key
+    if KEY_PATH.exists(): info(f"SSH key: {KEY_PATH}")
+    else: warn("No SSH key — run --setup first")
+    print()
+
+# ── Install as systemd service ────────────────────────────────────────────────
+def install_service():
+    script = Path(__file__).resolve()
+    service = textwrap.dedent(f"""
+        [Unit]
+        Description=Germany Reverse SSH Tunnel Manager
+        After=network-online.target
+        Wants=network-online.target
+
+        [Service]
+        Type=simple
+        ExecStart=/usr/bin/python3 {script}
+        Restart=always
+        RestartSec=10
+        User=root
+
+        [Install]
+        WantedBy=multi-user.target
+    """).strip()
+
+    svc_path = Path("/etc/systemd/system/germany-tunnel.service")
+    svc_path.write_text(service)
+    run(["systemctl", "daemon-reload"], timeout=10)
+    run(["systemctl", "enable", "germany-tunnel"], timeout=10)
+    run(["systemctl", "restart", "germany-tunnel"], timeout=10)
+    info(f"Service installed and started")
+    info("Manage with: systemctl status germany-tunnel")
+
+# ── Main Loop ─────────────────────────────────────────────────────────────────
+def run_tunnel(cfg):
+    iran_ip   = cfg["iran_ip"]
+    iran_user = cfg["iran_user"]
+    iran_port = cfg.get("iran_port", 22)
+
+    fail_count    = 0
+    alert_sent    = False
+    socks_proc    = None
+    tunnel_proc   = None
+    reconnect_count = 0
+
+    print(f"\n{C.CYN}{C.B}{'═'*60}")
+    print(f"  Germany Reverse Tunnel Manager v{__version__}")
+    print(f"  Iran target : {iran_user}@{iran_ip}:{iran_port}")
+    print(f"  SOCKS port  : Iran:{IRAN_SOCKS_PORT} ← Germany:{GERMANY_SOCKS_PORT}")
+    print(f"  Log file    : {LOG_FILE}")
+    print(f"  Press Ctrl+C to stop.")
+    print(f"{'═'*60}{C.R}\n")
+
+    # Start SOCKS5 server on Germany
+    socks_proc = start_socks_server()
+    if not socks_proc:
+        err("Cannot start SOCKS5 server"); sys.exit(1)
+
+    def _connect():
+        nonlocal tunnel_proc, reconnect_count
+        step(f"Connecting to Iran (attempt {reconnect_count + 1})")
+        p = start_reverse_tunnel(iran_ip, iran_user, iran_port)
+        if p:
+            tunnel_proc = p
+            reconnect_count += 1
+            info(f"Reverse tunnel active — Iran:{IRAN_SOCKS_PORT} → Germany SOCKS5")
+            return True
+        else:
+            err("Failed to establish tunnel")
+            return False
+
+    _connect()
+
+    while True:
+        time.sleep(HEALTH_INTERVAL)
+
+        # Check SOCKS server still alive
+        if socks_proc and socks_proc.poll() is not None:
+            warn("SOCKS5 server died — restarting...")
+            socks_proc = start_socks_server()
+
+        # Check tunnel process alive
+        tunnel_alive = tunnel_proc and tunnel_proc.poll() is None
+
+        if not tunnel_alive:
+            fail_count += 1
+            warn(f"Tunnel process died (failure #{fail_count}) — reconnecting in 5s...")
+            time.sleep(5)
+            if not _connect():
+                warn("Reconnect failed — retrying in 30s...")
+                time.sleep(30)
+                _connect()
+            continue
+
+        # Health check via Iran curl
+        if check_tunnel_health(iran_ip, iran_user, iran_port):
+            if fail_count > 0:
+                info(f"Tunnel recovered after {fail_count} failure(s)")
+                if alert_sent:
+                    send_email(cfg, "✅ Tunnel Recovered",
+                               f"Reverse tunnel to {iran_ip} recovered after {fail_count} failures.")
+                fail_count = 0; alert_sent = False
+            else:
+                dim(f"Health OK  [{time.strftime('%H:%M:%S')}]  reconnects={reconnect_count}")
+        else:
+            fail_count += 1
+            warn(f"Health check failed (failure #{fail_count}) — restarting tunnel...")
+            if tunnel_proc:
+                try: tunnel_proc.terminate(); tunnel_proc.wait(timeout=3)
+                except: pass
+            time.sleep(3)
+            _connect()
+
+            # Email after 3 consecutive failures
+            if fail_count >= 3 and not alert_sent:
+                send_email(cfg, f"🚨 Tunnel DOWN — {iran_ip}",
+                    f"Reverse tunnel to {iran_ip} has failed {fail_count} times.\n"
+                    f"Germany IP: {socket.gethostbyname(socket.gethostname())}\n"
+                    f"Time: {time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+                alert_sent = True
+
+# ── Entry Point ───────────────────────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        description="Germany Reverse SSH Tunnel Manager",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""
+            Examples:
+              python3 germany-tunnel-manager.py --setup          # First-time setup
+              python3 germany-tunnel-manager.py                  # Run tunnel
+              python3 germany-tunnel-manager.py --status         # Show status
+              python3 germany-tunnel-manager.py --install        # Install as systemd service
+        """)
+    )
+    parser.add_argument("--setup",   action="store_true", help="Run setup wizard")
+    parser.add_argument("--status",  action="store_true", help="Show current status")
+    parser.add_argument("--install", action="store_true", help="Install as systemd service")
+    parser.add_argument("--version", action="version", version=f"v{__version__}")
+    args = parser.parse_args()
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    KNOWN_HOSTS_FILE.touch(exist_ok=True)
+
+    if args.status:
+        show_status(); return
+
+    if args.install:
+        step("Installing systemd service")
+        install_service(); return
+
+    ensure_keys()
+
+    if args.setup or not CONFIG_FILE.exists():
+        cfg = setup_wizard()
+    else:
+        cfg = load_cfg()
+
+    if not cfg.get("iran_ip"):
+        err("No Iran IP configured. Run with --setup first."); sys.exit(1)
+
+    run_tunnel(cfg)
+
+if __name__ == "__main__":
+    try: main()
+    except KeyboardInterrupt: _sig(signal.SIGINT, None)
+    except Exception as e:
+        err(f"Fatal: {e}"); _log("ERROR", str(e))
+        import traceback; _log("ERROR", traceback.format_exc())
+        cleanup(); sys.exit(1)
