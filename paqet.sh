@@ -10,8 +10,18 @@ fi
 
 echo "[*] Updating package lists and installing dependencies..."
 if command -v apt-get >/dev/null; then
-    apt-get update
-    apt-get install -y curl wget iproute2 iptables libpcap-dev tar
+    # Disable exit-on-error temporarily to handle dpkg locks
+    set +e
+    until apt-get update; do
+        echo "[*] apt is locked (likely unattended-upgrades on a fresh VPS). Waiting 5 seconds..."
+        sleep 5
+    done
+    until apt-get install -y curl wget iproute2 iptables libpcap-dev tar; do
+        echo "[*] apt install is locked. Waiting 5 seconds..."
+        sleep 5
+    done
+    # Re-enable exit-on-error
+    set -e
 elif command -v yum >/dev/null; then
     yum check-update || true
     yum install -y curl wget iproute iptables libpcap-devel tar
@@ -64,14 +74,15 @@ chmod +x paqet
 
 echo "[*] Discovering network configuration..."
 PUBLIC_IP=$(curl -s --max-time 5 ifconfig.me || curl -s --max-time 5 api.ipify.org)
-IFACE=$(ip route | awk '/default/ {print $5}' | head -n1)
+# Robust parsing: dynamically find the word following "dev" and "via"
+IFACE=$(ip -4 route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n1)
 LOCAL_IP=$(ip -4 addr show "$IFACE" | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
-GW_IP=$(ip route | awk '/default/ {print $3}' | head -n1)
+GW_IP=$(ip -4 route show default | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1)}' | head -n1)
 
 echo "[*] IFACE: $IFACE | LOCAL IP: $LOCAL_IP | GATEWAY: $GW_IP"
 
 echo "[*] Pinging gateway to populate ARP table..."
-ping -c 1 -W 1 "$GW_IP" || true
+ping -c 1 -W 1 "$GW_IP" >/dev/null 2>&1 || true
 GW_MAC=$(ip neigh show "$GW_IP" | grep -ioE '([a-f0-9]{2}:){5}[a-f0-9]{2}' | head -n1)
 
 if [ -z "$GW_MAC" ]; then
@@ -113,14 +124,18 @@ echo "🎯 SUCCESS: SERVER CONFIGURED. PASTE THIS ENTIRE BLOCK ON THE CLIENT:"
 echo "=================================================================="
 cat <<EOF
 echo "[*] Auto-discovering client network..."
-IFACE=\$(ip route | awk '/default/ {print \$5}' | head -n1)
+IFACE=\$(ip -4 route show default | awk '{for(i=1;i<=NF;i++) if(\$i=="dev") print \$(i+1)}' | head -n1)
 LOCAL_IP=\$(ip -4 addr show "\$IFACE" | awk '/inet / {print \$2}' | cut -d/ -f1 | head -n1)
-GW_IP=\$(ip route | awk '/default/ {print \$3}' | head -n1)
+GW_IP=\$(ip -4 route show default | awk '{for(i=1;i<=NF;i++) if(\$i=="via") print \$(i+1)}' | head -n1)
 ping -c 1 -W 1 "\$GW_IP" >/dev/null 2>&1 || true
 GW_MAC=\$(ip neigh show "\$GW_IP" | grep -ioE '([a-f0-9]{2}:){5}[a-f0-9]{2}' | head -n1)
 
-echo "[*] Generating client_config.yaml..."
-cat > client_config.yaml <<CFG
+if [ -z "\$IFACE" ] || [ -z "\$GW_MAC" ]; then
+    echo "[!] Discovery failed! IFACE: '\$IFACE', LOCAL_IP: '\$LOCAL_IP', GW_MAC: '\$GW_MAC'"
+    echo "[!] Exiting before overwriting config."
+else
+    echo "[*] Generating client_config.yaml..."
+    cat > client_config.yaml <<CFG
 role: "client"
 log:
   level: "info"
@@ -144,8 +159,9 @@ transport:
     pshard: 3
 CFG
 
-echo "[*] Starting client..."
-sudo ./paqet run -c client_config.yaml
+    echo "[*] Starting client..."
+    sudo paqet run -c client_config.yaml
+fi
 EOF
 echo "=================================================================="
 echo ""
