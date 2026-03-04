@@ -20,19 +20,25 @@ else
     exit 1
 fi
 
-echo "[*] Fetching the latest paqet release URL..."
-# Query all releases (because alphas don't show in /latest), search for linux-amd64 and .tar.gz
-LATEST_URL=$(curl -s https://api.github.com/repos/hanselime/paqet/releases | grep "browser_download_url.*linux-amd64.*\.tar\.gz" | head -n 1 | cut -d '"' -f 4)
+echo "[*] Fetching the latest paqet release URL (bypassing API limits)..."
+# Scrape the releases HTML page to find the latest tag, avoiding GitHub API rate limits
+LATEST_TAG=$(curl -sL https://github.com/hanselime/paqet/releases | grep -o 'href="/hanselime/paqet/releases/tag/[^"]*"' | head -n 1 | awk -F'/' '{print $NF}' | tr -d '"')
 
-if [ -z "$LATEST_URL" ]; then
-    echo "[!] Failed to find release URL. Here is what GitHub returned for browser_download_urls:"
-    curl -s https://api.github.com/repos/hanselime/paqet/releases | grep "browser_download_url" || echo "No URLs found at all."
+if [ -z "$LATEST_TAG" ]; then
+    echo "[!] Failed to scrape latest tag from GitHub."
+    echo "[!] Dumping page output for debugging:"
+    curl -sL https://github.com/hanselime/paqet/releases | head -n 20
     exit 1
 fi
 
-echo "[*] Found URL: $LATEST_URL"
+echo "[*] Latest tag identified as: $LATEST_TAG"
+
+# Construct the exact download URL using the scraped tag
+LATEST_URL="https://github.com/hanselime/paqet/releases/download/${LATEST_TAG}/paqet-linux-amd64-${LATEST_TAG}.tar.gz"
+echo "[*] Download URL: $LATEST_URL"
+
 echo "[*] Downloading archive..."
-wget -O paqet.tar.gz "$LATEST_URL"
+wget -q --show-progress -O paqet.tar.gz "$LATEST_URL" || curl -L -o paqet.tar.gz "$LATEST_URL"
 
 echo "[*] Extracting archive..."
 # -v makes tar verbose so we can see exactly what files come out
