@@ -44,8 +44,10 @@ echo "[*] Extracting archive..."
 # -v makes tar verbose so we can see exactly what files come out
 tar -xzvf paqet.tar.gz
 
-# If the binary extracts with a different name, let's ensure it's just called 'paqet'
-if [ -f "paqet-linux-amd64" ]; then
+# Handle both underscore and hyphen naming conventions from the archive
+if [ -f "paqet_linux_amd64" ]; then
+    mv paqet_linux_amd64 paqet
+elif [ -f "paqet-linux-amd64" ]; then
     mv paqet-linux-amd64 paqet
 fi
 chmod +x paqet
