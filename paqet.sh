@@ -1,47 +1,72 @@
 #!/bin/bash
+# Exit on any error, but print commands as they run so we can see what's happening
 set -e
 
-# 1. Ensure root privileges
+echo "[*] Ensuring root privileges..."
 if [ "$EUID" -ne 0 ]; then
   echo "[!] Please run as root (sudo)"
   exit 1
 fi
 
 echo "[*] Updating package lists and installing dependencies..."
-apt-get update -qq >/dev/null 2>&1 || yum check-update -q >/dev/null 2>&1 || true
-apt-get install -y -qq curl wget iproute2 iptables libpcap-dev >/dev/null 2>&1 || \
-yum install -y -q curl wget iproute iptables libpcap-devel >/dev/null 2>&1
-
-# 2. Download latest paqet binary
-echo "[*] Fetching the latest paqet release..."
-LATEST_URL=$(curl -s https://api.github.com/repos/hanselime/paqet/releases/latest | grep "browser_download_url.*linux_amd64" | cut -d '"' -f 4)
-if [ -z "$LATEST_URL" ]; then
-    echo "[!] Failed to find latest release URL."
+if command -v apt-get >/dev/null; then
+    apt-get update
+    apt-get install -y curl wget iproute2 iptables libpcap-dev tar
+elif command -v yum >/dev/null; then
+    yum check-update || true
+    yum install -y curl wget iproute iptables libpcap-devel tar
+else
+    echo "[!] Unsupported package manager. Need apt or yum."
     exit 1
 fi
-curl -sL -o paqet "$LATEST_URL"
+
+echo "[*] Fetching the latest paqet release URL..."
+# Query all releases (because alphas don't show in /latest), search for linux-amd64 and .tar.gz
+LATEST_URL=$(curl -s https://api.github.com/repos/hanselime/paqet/releases | grep "browser_download_url.*linux-amd64.*\.tar\.gz" | head -n 1 | cut -d '"' -f 4)
+
+if [ -z "$LATEST_URL" ]; then
+    echo "[!] Failed to find release URL. Here is what GitHub returned for browser_download_urls:"
+    curl -s https://api.github.com/repos/hanselime/paqet/releases | grep "browser_download_url" || echo "No URLs found at all."
+    exit 1
+fi
+
+echo "[*] Found URL: $LATEST_URL"
+echo "[*] Downloading archive..."
+wget -O paqet.tar.gz "$LATEST_URL"
+
+echo "[*] Extracting archive..."
+# -v makes tar verbose so we can see exactly what files come out
+tar -xzvf paqet.tar.gz
+
+# If the binary extracts with a different name, let's ensure it's just called 'paqet'
+if [ -f "paqet-linux-amd64" ]; then
+    mv paqet-linux-amd64 paqet
+fi
 chmod +x paqet
 
-# 3. Network Discovery
 echo "[*] Discovering network configuration..."
 PUBLIC_IP=$(curl -s --max-time 5 ifconfig.me || curl -s --max-time 5 api.ipify.org)
 IFACE=$(ip route | awk '/default/ {print $5}' | head -n1)
 LOCAL_IP=$(ip -4 addr show "$IFACE" | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
 GW_IP=$(ip route | awk '/default/ {print $3}' | head -n1)
 
-# Ping gateway to populate ARP table, then extract MAC
-ping -c 1 -W 1 "$GW_IP" >/dev/null 2>&1
+echo "[*] IFACE: $IFACE | LOCAL IP: $LOCAL_IP | GATEWAY: $GW_IP"
+
+echo "[*] Pinging gateway to populate ARP table..."
+ping -c 1 -W 1 "$GW_IP" || true
 GW_MAC=$(ip neigh show "$GW_IP" | grep -ioE '([a-f0-9]{2}:){5}[a-f0-9]{2}' | head -n1)
 
 if [ -z "$GW_MAC" ]; then
-    echo "[!] Could not resolve gateway MAC address for $GW_IP on $IFACE."
+    echo "[!] Could not resolve gateway MAC address. Dumping ARP table for debugging:"
+    ip neigh show
     exit 1
 fi
+echo "[*] Gateway MAC resolved to: $GW_MAC"
 
 PORT=$(shuf -i 10000-60000 -n 1)
 SECRET=$(./paqet secret)
 
-# 4. Generate Server Configuration
+echo "[*] Generating server_config.yaml..."
 cat > server_config.yaml <<EOF
 role: "server"
 log:
@@ -64,7 +89,6 @@ transport:
     pshard: 3
 EOF
 
-# 5. Output Client Configuration
 echo ""
 echo "=================================================================="
 echo "🎯 SUCCESS: SERVER CONFIGURED. COPY THE CLIENT CONFIG BELOW:"
@@ -95,7 +119,6 @@ EOF
 echo "=================================================================="
 echo ""
 
-# 6. Apply Firewall Rules & Setup Trap
 echo "[*] Applying iptables bypass rules to hide from kernel tracking..."
 iptables -t raw -A PREROUTING -p tcp --dport "$PORT" -j NOTRACK
 iptables -t raw -A OUTPUT -p tcp --sport "$PORT" -j NOTRACK
@@ -111,6 +134,5 @@ cleanup() {
 }
 trap cleanup SIGINT SIGTERM EXIT
 
-# 7. Run Server
-echo "[*] Starting paqet server in the foreground. Press Ctrl+C to stop."
+echo "[*] Starting paqet server. Press Ctrl+C to safely stop."
 ./paqet run -c server_config.yaml
