@@ -109,19 +109,28 @@ EOF
 
 echo ""
 echo "=================================================================="
-echo "🎯 SUCCESS: SERVER CONFIGURED. COPY THE CLIENT CONFIG BELOW:"
+echo "🎯 SUCCESS: SERVER CONFIGURED. PASTE THIS ENTIRE BLOCK ON THE CLIENT:"
 echo "=================================================================="
 cat <<EOF
+echo "[*] Auto-discovering client network..."
+IFACE=\$(ip route | awk '/default/ {print \$5}' | head -n1)
+LOCAL_IP=\$(ip -4 addr show "\$IFACE" | awk '/inet / {print \$2}' | cut -d/ -f1 | head -n1)
+GW_IP=\$(ip route | awk '/default/ {print \$3}' | head -n1)
+ping -c 1 -W 1 "\$GW_IP" >/dev/null 2>&1 || true
+GW_MAC=\$(ip neigh show "\$GW_IP" | grep -ioE '([a-f0-9]{2}:){5}[a-f0-9]{2}' | head -n1)
+
+echo "[*] Generating client_config.yaml..."
+cat > client_config.yaml <<CFG
 role: "client"
 log:
   level: "info"
 socks5:
   - listen: "127.0.0.1:1080"
 network:
-  interface: "REPLACE_WITH_CLIENT_INTERFACE"
+  interface: "\$IFACE"
   ipv4:
-    addr: "REPLACE_WITH_CLIENT_LOCAL_IP:0"
-    router_mac: "REPLACE_WITH_CLIENT_GATEWAY_MAC"
+    addr: "\$LOCAL_IP:0"
+    router_mac: "\$GW_MAC"
 server:
   addr: "$PUBLIC_IP:$PORT"
 transport:
@@ -133,6 +142,10 @@ transport:
     key: "$SECRET"
     dshard: 10
     pshard: 3
+CFG
+
+echo "[*] Starting client..."
+sudo ./paqet run -c client_config.yaml
 EOF
 echo "=================================================================="
 echo ""
