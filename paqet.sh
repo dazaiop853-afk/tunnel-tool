@@ -44,12 +44,22 @@ echo "[*] Extracting archive..."
 # -v makes tar verbose so we can see exactly what files come out
 tar -xzvf paqet.tar.gz
 
-# Handle both underscore and hyphen naming conventions from the archive
-if [ -f "paqet_linux_amd64" ]; then
-    mv paqet_linux_amd64 paqet
-elif [ -f "paqet-linux-amd64" ]; then
-    mv paqet-linux-amd64 paqet
+# Brute-force rename: Find any file starting with 'paqet' and containing 'amd64' 
+# that ISN'T the tar.gz file, and rename it to 'paqet'
+for f in paqet*amd64*; do
+    if [ "$f" != "paqet.tar.gz" ]; then
+        mv "$f" paqet
+        break
+    fi
+done
+
+# Verify it actually exists before trying to chmod
+if [ ! -f "paqet" ]; then
+    echo "[!] Critical Error: Could not find the extracted binary to rename!"
+    ls -la
+    exit 1
 fi
+
 chmod +x paqet
 
 echo "[*] Discovering network configuration..."
